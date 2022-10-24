@@ -1,6 +1,7 @@
 import argparse
 
 import os
+
 # limit the number of cpus used by high performance libraries
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -13,6 +14,14 @@ import numpy as np
 from pathlib import Path
 import torch
 import torch.backends.cudnn as cudnn
+
+import numpy as np
+import random
+import torchvision.ops.boxes as bops
+from PIL import ImageDraw
+from collections import Counter
+from ast import literal_eval
+import glob
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # yolov5 strongsort root directory
@@ -27,14 +36,16 @@ if str(ROOT / 'trackers' / 'strong_sort') not in sys.path:
 if str(ROOT / 'trackers' / 'ocsort') not in sys.path:
     sys.path.append(str(ROOT / 'trackers' / 'ocsort'))  # add strong_sort ROOT to PATH
 if str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid') not in sys.path:
-    sys.path.append(str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid'))  # add strong_sort ROOT to PATH
+    sys.path.append(
+        str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid'))  # add strong_sort ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import logging
 from yolov5.models.common import DetectMultiBackend
 from yolov5.utils.dataloaders import VID_FORMATS, LoadImages, LoadStreams
 from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
-                                  check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, print_args, check_file)
+                                  check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, print_args,
+                                  check_file)
 from yolov5.utils.torch_utils import select_device, time_sync
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from trackers.multi_tracker_zoo import create_tracker
@@ -42,9 +53,11 @@ from trackers.multi_tracker_zoo import create_tracker
 # remove duplicated stream handler to avoid duplicated logging
 logging.getLogger().removeHandler(logging.getLogger().handlers[0])
 
+
 @torch.no_grad()
 def run(
         source='0',
+        source_dir='',
         yolo_weights=WEIGHTS / 'yolov5m.pt',  # model.pt path(s),
         appearance_descriptor_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
         tracking_method='strongsort',
@@ -67,7 +80,7 @@ def run(
         project=ROOT / 'runs/track',  # save results to project/name
         name='exp',  # save results to project/name
         exist_ok=False,  # existing project/name ok, do not increment
-        line_thickness=2,  # bounding box thickness (pixels)
+        line_thickness=3,  # bounding box thickness (pixels)
         hide_labels=False,  # hide labels
         hide_conf=False,  # hide confidences
         hide_class=False,  # hide IDs
@@ -75,7 +88,6 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         eval=False,  # run multi-gpu eval
 ):
-
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (VID_FORMATS)
@@ -125,11 +137,20 @@ def run(
                 tracker_list[i].model.warmup()
     outputs = [None] * nr_sources
 
+    interatction_path = 'Interaction_Result.txt'
+
+    # Run inference
+    ids = []
+    temp_ids = []
+    count = 0
+    count_ids = Counter()
+
     # Run tracking
     model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
-    for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):
+    for frame_idx, (path, im, im0s, vid_cap, s, frames) in enumerate(dataset):
+        all_frames = frames
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
         im = im.half() if half else im.float()  # uint8 to fp16/32
@@ -176,7 +197,7 @@ def run(
             imc = im0.copy() if save_crop else im0  # for save_crop
 
             annotator = Annotator(im0, line_width=line_thickness, pil=not ascii)
-            #if cfg.STRONGSORT.ECC:  # camera motion compensation
+            # if cfg.STRONGSORT.ECC:  # camera motion compensation
             #    strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
 
             if det is not None and len(det):
@@ -200,11 +221,41 @@ def run(
 
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
+                    outputs[i][:, 0], outputs[i][:, 2] = outputs[i][:, 0] * 0.98, outputs[i][:, 2] * 1.02
+
+                    ious = torch.triu(bops.box_iou(torch.tensor(outputs[i][:, 0:4]), torch.tensor(outputs[i][:, 0:4])),
+                                      diagonal=1)
+                    # ious = ious > 0.1
+                    iou_idx = torch.nonzero(ious).cpu()
+
+                    center_x, center_y = (outputs[i][:, 0] + outputs[i][:, 2]) / 2, (outputs[i][:, 1] + outputs[i][:, 3]) / 2
+                    centers = np.stack([center_x, center_y, outputs[i][:, 4]], axis=1)
+
+                    for v in iou_idx:
+                        count += 1
+                        interact1, interact2 = centers[int(v[0])], centers[int(v[1])]
+                        idx = [int(interact1[2]), int(interact2[2])]
+                        ids.append(idx)
+                        s += f" interact success: {count} "
+
+                    if frame_idx != 0 and frame_idx % 60 == 0:
+                        str_ids = list(map(str, ids))
+                        count_ids = Counter(str_ids)
+                        ids = []
+
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
-    
+
                         bboxes = output[0:4]
                         id = output[4]
                         cls = output[5]
+
+                        thres = 30
+                        intrac_group = {x for x, count in count_ids.items() if count >= thres}
+
+                        c = int(cls)  # integer class
+                        label = f'{id} {names[c]} {conf:.2f}'
+                        annotator.box_label(bboxes, label, iou_idx, centers, color=colors(id, True),
+                                            interaction=intrac_group, boxes=outputs[i])
 
                         if save_txt:
                             # to MOT format
@@ -217,20 +268,19 @@ def run(
                                 f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
                                                                bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
 
-                        if save_vid or save_crop or show_vid:  # Add bbox to image
-                            c = int(cls)  # integer class
-                            id = int(id)  # integer id
-                            label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
-                                (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
-                            annotator.box_label(bboxes, label, color=colors(c, True))
-                            if save_crop:
-                                txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
-                                save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
+                        # if save_vid or save_crop or show_vid:  # Add bbox to image
+                        #     c = int(cls)  # integer class
+                        #     id = int(id)  # integer id
+                        #     label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}')
+                        #     annotator.box_label(bboxes, label, color=colors(c, True))
+                        #     if save_crop:
+                        #         txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
+                        #         save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
 
                 LOGGER.info(f'{s}Done. yolo:({t3 - t2:.3f}s), {tracking_method}:({t5 - t4:.3f}s)')
 
             else:
-                #strongsort_list[i].increment_ages()
+                # strongsort_list[i].increment_ages()
                 LOGGER.info('No detections')
 
             # Stream results
@@ -259,12 +309,16 @@ def run(
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
-    LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms strong sort update per image at shape {(1, 3, *imgsz)}' % t)
+    success_ratio = round((count / all_frames) * 100)
+    LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms strong sort update per image at shape'
+                f' {(1, 3, *imgsz)} Group recongnition ratio: {success_ratio} %%' % t)
     if save_txt or save_vid:
         s = f"\n{len(list(save_dir.glob('tracks/*.txt')))} tracks saved to {save_dir / 'tracks'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(yolo_weights)  # update model (to fix SourceChangeWarning)
+
+    return success_ratio
 
 
 def parse_opt():
@@ -272,7 +326,8 @@ def parse_opt():
     parser.add_argument('--yolo-weights', nargs='+', type=Path, default=WEIGHTS / 'yolov5m.pt', help='model.pt path(s)')
     parser.add_argument('--appearance-descriptor-weights', type=Path, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
     parser.add_argument('--tracking-method', type=str, default='strongsort', help='strongsort, ocsort')
-    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
+    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
+    parser.add_argument('--source_dir', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
@@ -308,7 +363,31 @@ def parse_opt():
 
 def main(opt):
     check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
-    run(**vars(opt))
+    """
+    For folder evaluation
+    """
+    folders = glob.glob(opt.source_dir + "*")
+    P = 0
+    N = 0
+    interaction_path = 'Interaction_Result'
+    with open(interaction_path, 'w') as f:
+        for i, v in enumerate(folders):
+            opt.source = v
+            success = run(**vars(opt))
+            # ratio = list(range(5,100,5))
+            # for r in ratio:
+            if success > 50:
+                P += 1
+            else:
+                N += 1
+
+            f.write('Video ' + str(i) + '  Acc: ' + str(success) + '%' + '\n')
+            message = "Success: " + str(P) + " || Fail: " + str(N) + " || Precision: " + str(
+                round((P / (P + N)) * 100)) + "%" + '\n'
+            print(message)
+            if i != 0 and i % 10 == 0:
+                f.write(message)
+    # run(**vars(opt))
 
 
 if __name__ == "__main__":
