@@ -22,6 +22,11 @@ from PIL import ImageDraw
 from collections import Counter
 from ast import literal_eval
 import glob
+import time
+import math
+import scipy.spatial.distance as dist
+
+from detect_group import *
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # yolov5 strongsort root directory
@@ -47,7 +52,7 @@ from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, s
                                   check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, print_args,
                                   check_file)
 from yolov5.utils.torch_utils import select_device, time_sync
-from yolov5.utils.plots import Annotator, colors, save_one_box
+from yolov5.utils.plots2 import Annotator, colors, save_one_box
 from trackers.multi_tracker_zoo import create_tracker
 
 # remove duplicated stream handler to avoid duplicated logging
@@ -59,11 +64,11 @@ def run(
         source='0',
         source_dir='',
         yolo_weights=WEIGHTS / 'yolov5m.pt',  # model.pt path(s),
-        appearance_descriptor_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
+        appearance_descriptor_weights=WEIGHTS / 'osnet_x1_0_msmt17.pt',  # model.pt path,
         tracking_method='strongsort',
         imgsz=(640, 640),  # inference size (height, width)
-        conf_thres=0.25,  # confidence threshold
-        iou_thres=0.45,  # NMS IOU threshold
+        conf_thres=0.5,  # confidence threshold
+        iou_thres=0.7,  # NMS IOU threshold
         max_det=1000,  # maximum detections per image
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
         show_vid=False,  # show results
@@ -88,6 +93,7 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         eval=False,  # run multi-gpu eval
 ):
+    global intract_group
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (VID_FORMATS)
@@ -141,9 +147,14 @@ def run(
 
     # Run inference
     ids = []
+    ids_union = []
     temp_ids = []
+    union_id = []
     count = 0
     count_ids = Counter()
+    group_id_list = {}
+    group_count = 0
+    union_ids = []
 
     # Run tracking
     model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
@@ -218,44 +229,77 @@ def run(
                 outputs[i] = tracker_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
                 t5 = time_sync()
                 dt[3] += t5 - t4
+                # group_id = 0
 
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
-                    outputs[i][:, 0], outputs[i][:, 2] = outputs[i][:, 0] * 0.98, outputs[i][:, 2] * 1.02
+                    # outputs[i][:, 0], outputs[i][:, 2] = outputs[i][:, 0] * 0.98, outputs[i][:, 2] * 1.02
+                    bbox = outputs[i][:, :4]
 
-                    ious = torch.triu(bops.box_iou(torch.tensor(outputs[i][:, 0:4]), torch.tensor(outputs[i][:, 0:4])),
+                    ious = torch.triu(bops.box_iou(torch.tensor(bbox), torch.tensor(bbox)),
                                       diagonal=1)
+                    # print(f"{end - start:.5f} sec")
                     # ious = ious > 0.1
                     iou_idx = torch.nonzero(ious).cpu()
-
-                    center_x, center_y = (outputs[i][:, 0] + outputs[i][:, 2]) / 2, (outputs[i][:, 1] + outputs[i][:, 3]) / 2
+                    # print(iou_idx)
+                    center_x, center_y = (outputs[i][:, 0] + outputs[i][:, 2]) / 2, (
+                                outputs[i][:, 1] + outputs[i][:, 3]) / 2
                     centers = np.stack([center_x, center_y, outputs[i][:, 4]], axis=1)
+
+                    # dists = dist.pdist(centers[:,:2])
+
 
                     for v in iou_idx:
                         count += 1
                         interact1, interact2 = centers[int(v[0])], centers[int(v[1])]
                         idx = [int(interact1[2]), int(interact2[2])]
                         ids.append(idx)
-                        s += f" interact success: {count} "
 
-                    if frame_idx != 0 and frame_idx % 60 == 0:
+                    # union_ids_graph = to_graph(ids)
+                    # union_id = list(connected_components(union_ids_graph))
+                    # union_ids.append(union_id)
+                    #
+                    # print(list(connected_components(union_ids)))
+
+                    if frame_idx != 0 and frame_idx % 120 == 0:
                         str_ids = list(map(str, ids))
                         count_ids = Counter(str_ids)
+                        # count_ids = [literal_eval(x) for x in count_ids.keys()]
                         ids = []
+
+                        thres = 60
+                        intract_group = [x for x, count in count_ids.items() if count >= thres]
+                        intract_group = [literal_eval(x) for x in intract_group]
+                        union_ids_graph = to_graph(intract_group)
+                        union_id = list(connected_components(union_ids_graph))
+
+                        union_id = [list(x) for x in union_id]
+                        if union_id:
+                            print(union_id)
+                            union_ids.append(union_id[0])
+
+                        for g in union_ids:
+                            # g = literal_eval(g)  # convert string to list
+                            if g not in list(group_id_list.values()):
+                                group_id_list[group_count] = g
+                                group_count += 1
+
+                    # count_ids, iou_idx, centers = detect_group(outputs[i], 100, frame_idx)
 
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
 
                         bboxes = output[0:4]
-                        id = output[4]
+                        id = int(output[4])
                         cls = output[5]
-
-                        thres = 30
-                        intrac_group = {x for x, count in count_ids.items() if count >= thres}
+                        if group_id_list:
+                            group_key = check_group(id, group_id_list)
+                        else:
+                            group_key = 0
 
                         c = int(cls)  # integer class
-                        label = f'{id} {names[c]} {conf:.2f}'
+                        label = f'id: {id} group id: {group_key} {names[c]} {conf:.2f}'
                         annotator.box_label(bboxes, label, iou_idx, centers, color=colors(id, True),
-                                            interaction=intrac_group, boxes=outputs[i])
+                                            interaction=union_ids, boxes=outputs[i])
 
                         if save_txt:
                             # to MOT format
@@ -329,9 +373,9 @@ def parse_opt():
     parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--source_dir', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
-    parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.7, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
-    parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
+    parser.add_argument('--max-det', type=int, default=100, help='maximum detections per image')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
