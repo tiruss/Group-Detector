@@ -155,12 +155,15 @@ def run(
     group_id_list = {}
     group_count = 0
     union_ids = []
-
+    union_groups = []
+    num_group = []
     # Run tracking
     model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
     for frame_idx, (path, im, im0s, vid_cap, s, frames) in enumerate(dataset):
+        # if frame_idx == 660:
+        #     return sum(num_group)
         all_frames = frames
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -233,73 +236,70 @@ def run(
 
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
-                    # outputs[i][:, 0], outputs[i][:, 2] = outputs[i][:, 0] * 0.98, outputs[i][:, 2] * 1.02
+                    outputs[i][:, 0], outputs[i][:, 2] = outputs[i][:, 0] * 0.98, outputs[i][:, 2] * 1.02
+                    outputs[i][:, 1], outputs[i][:, 3] = outputs[i][:, 1] * 1.05, outputs[i][:, 3] * 0.95
                     bbox = outputs[i][:, :4]
 
                     ious = torch.triu(bops.box_iou(torch.tensor(bbox), torch.tensor(bbox)),
                                       diagonal=1)
-                    # print(f"{end - start:.5f} sec")
-                    # ious = ious > 0.1
+
                     iou_idx = torch.nonzero(ious).cpu()
-                    # print(iou_idx)
                     center_x, center_y = (outputs[i][:, 0] + outputs[i][:, 2]) / 2, (
                                 outputs[i][:, 1] + outputs[i][:, 3]) / 2
                     centers = np.stack([center_x, center_y, outputs[i][:, 4]], axis=1)
 
-                    # dists = dist.pdist(centers[:,:2])
-
-
                     for v in iou_idx:
-                        count += 1
                         interact1, interact2 = centers[int(v[0])], centers[int(v[1])]
                         idx = [int(interact1[2]), int(interact2[2])]
+                        count += 1
                         ids.append(idx)
 
-                    # union_ids_graph = to_graph(ids)
-                    # union_id = list(connected_components(union_ids_graph))
-                    # union_ids.append(union_id)
-                    #
-                    # print(list(connected_components(union_ids)))
-
-                    if frame_idx != 0 and frame_idx % 120 == 0:
+                    if frame_idx != 0 and frame_idx % 60 == 0:
                         str_ids = list(map(str, ids))
                         count_ids = Counter(str_ids)
+
                         # count_ids = [literal_eval(x) for x in count_ids.keys()]
                         ids = []
 
-                        thres = 60
-                        intract_group = [x for x, count in count_ids.items() if count >= thres]
-                        intract_group = [literal_eval(x) for x in intract_group]
-                        union_ids_graph = to_graph(intract_group)
-                        union_id = list(connected_components(union_ids_graph))
+                        threshold = 50
+                        for k, v in count_ids.items():
+                            if v > threshold:
+                                ids.append(k)
 
-                        union_id = [list(x) for x in union_id]
-                        if union_id:
-                            print(union_id)
-                            union_ids.append(union_id[0])
+                        ids = [literal_eval(x) for x in ids]
+                        G = to_graph(ids)
+                        ids = list(connected_components(G))
+                        ids = [list(x) for x in ids]
 
-                        for g in union_ids:
-                            # g = literal_eval(g)  # convert string to list
-                            if g not in list(group_id_list.values()):
-                                group_id_list[group_count] = g
-                                group_count += 1
+                        if ids:
+                            union_groups.append(ids[0])
 
-                    # count_ids, iou_idx, centers = detect_group(outputs[i], 100, frame_idx)
+                        if ids and len(union_groups) > 1:
+                            union_groups = merge_unify_group(union_groups)
 
+                        group_id_list = {k:v for k, v in enumerate(union_groups, start=1)}
+
+                    detected_group = len(group_id_list)+1
+                    # print('detected_group', detected_group)
+                    temp_num_group = []
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
 
                         bboxes = output[0:4]
                         id = int(output[4])
                         cls = output[5]
+                        # print(group_id_list)
                         if group_id_list:
-                            group_key = check_group(id, group_id_list)
+                            group_key = check_group_key(id, group_id_list)
                         else:
                             group_key = 0
-
+                        temp_num_group.append(group_key)
+                        # print(temp_num_group)
                         c = int(cls)  # integer class
                         label = f'id: {id} group id: {group_key} {names[c]} {conf:.2f}'
                         annotator.box_label(bboxes, label, iou_idx, centers, color=colors(id, True),
                                             interaction=union_ids, boxes=outputs[i])
+
+                        # print("Current Group ID: ", group_key)
 
                         if save_txt:
                             # to MOT format
@@ -320,7 +320,8 @@ def run(
                         #     if save_crop:
                         #         txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
                         #         save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
-
+                    num_group.append(len(set(temp_num_group)))
+                    # print(num_group)
                 LOGGER.info(f'{s}Done. yolo:({t3 - t2:.3f}s), {tracking_method}:({t5 - t4:.3f}s)')
 
             else:
@@ -362,7 +363,7 @@ def run(
     if update:
         strip_optimizer(yolo_weights)  # update model (to fix SourceChangeWarning)
 
-    return success_ratio
+    return sum(num_group)
 
 
 def parse_opt():
@@ -373,8 +374,8 @@ def parse_opt():
     parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--source_dir', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
-    parser.add_argument('--conf-thres', type=float, default=0.7, help='confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.7, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=100, help='maximum detections per image')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
@@ -410,27 +411,30 @@ def main(opt):
     """
     For folder evaluation
     """
-    folders = glob.glob(opt.source_dir + "*")
+
+    # num_group = run(**vars(opt))
+    # print(num_group)
+    folders = glob(opt.source_dir + "*")
     P = 0
     N = 0
     interaction_path = 'Interaction_Result'
     with open(interaction_path, 'w') as f:
         for i, v in enumerate(folders):
             opt.source = v
-            success = run(**vars(opt))
+            num_group = run(**vars(opt))
             # ratio = list(range(5,100,5))
             # for r in ratio:
-            if success > 50:
-                P += 1
-            else:
-                N += 1
-
-            f.write('Video ' + str(i) + '  Acc: ' + str(success) + '%' + '\n')
-            message = "Success: " + str(P) + " || Fail: " + str(N) + " || Precision: " + str(
-                round((P / (P + N)) * 100)) + "%" + '\n'
-            print(message)
-            if i != 0 and i % 10 == 0:
-                f.write(message)
+            # if success > 50:
+            #     P += 1
+            # else:
+            #     N += 1
+            #
+            # f.write('Video ' + str(i) + '  Acc: ' + str(success) + '%' + '\n')
+            # message = "Success: " + str(P) + " || Fail: " + str(N) + " || Precision: " + str(
+            #     round((P / (P + N)) * 100)) + "%" + '\n'
+            # print(message)
+            # if i != 0 and i % 10 == 0:
+            #     f.write(message)
     # run(**vars(opt))
 
 
